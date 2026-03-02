@@ -39,16 +39,25 @@ return {
       desc = 'Toggle Codex popup or side-panel',
       mode = { 'n', 't' }
     },
+    {
+      '<leader>cs', -- Optional visual-mode mapping to send selected text to Codex
+      function() require('codex').send_selection() end,
+      desc = 'Send selection to Codex',
+      mode = 'x'
+    },
   },
   opts = {
     keymaps     = {
       toggle = nil, -- Keybind to toggle Codex window (Disabled by default, watch out for conflicts)
       quit = '<C-q>', -- Keybind to close the Codex window (default: Ctrl + q)
+      send_selection = nil, -- Visual-mode keybind to send the current selection to Codex
     },         -- Disable internal default keymap (<leader>cc -> :CodexToggle)
     border      = 'rounded',  -- Options: 'single', 'double', or 'rounded'
     width       = 0.8,        -- Width of the floating window (0.0 to 1.0)
     height      = 0.8,        -- Height of the floating window (0.0 to 1.0)
     model       = nil,        -- Optional: pass a string to use a specific model (e.g., 'o3-mini')
+    sandbox     = nil,        -- Optional default sandbox: 'read-only', 'workspace-write', or 'danger-full-access'
+    approval    = nil,        -- Optional default approval policy: 'untrusted', 'on-failure', 'on-request', or 'never'
     autoinstall = true,       -- Automatically install the Codex CLI if not found
     panel       = false,      -- Open Codex in a side-panel (vertical split) instead of floating window
     use_buffer  = false,      -- Capture Codex stdout into a normal buffer instead of a terminal buffer
@@ -58,6 +67,12 @@ return {
 ### Usage:
 - Call `:Codex` (or `:CodexToggle`) to open or close the Codex popup or side-panel.
 - Map your own keybindings via the `keymaps.toggle` setting.
+- Use `:CodexSendSelection` in visual mode, or configure `keymaps.send_selection`, to send highlighted text to Codex.
+- If a Codex chat is already running, the selection is sent to that existing session and the window is focused immediately.
+- If no Codex chat is running, the selection starts a new session as the initial prompt.
+- To set a default Codex sandbox, use `sandbox = 'workspace-write'` (or `read-only` / `danger-full-access`) in setup.
+- To set a default approval policy, use `approval = 'on-request'` (or `untrusted` / `on-failure` / `never`) in setup.
+- To override launch options for a single session, run commands like `:Codex danger-full-access on-request` or `:CodexToggle workspace-write never`.
 - To choose floating popup vs side-panel, set `panel = false` (popup) or `panel = true` (panel) in your setup options.
 - To capture Codex output in an editable buffer instead of a terminal, set `use_buffer = true` (or `false` to keep terminal) in your setup options.
 - Add the following code to show backgrounded Codex window in lualine:
