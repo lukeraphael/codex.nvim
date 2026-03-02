@@ -8,30 +8,228 @@ local config = {
   keymaps = {
     toggle = nil,
     quit = '<C-q>', -- Default: Ctrl+q to quit
+    send_selection = nil,
   },
   border = 'single',
   width = 0.8,
   height = 0.8,
   cmd = 'codex',
   model = nil, -- Default to the latest model
+  sandbox = nil, -- Optional default sandbox mode for Codex CLI
+  approval = nil, -- Optional default approval policy for Codex CLI
   autoinstall = true,
   panel     = false,   -- if true, open Codex in a side-panel instead of floating window
   use_buffer = false,  -- if true, capture Codex stdout into a normal buffer instead of a terminal
 }
 
+local valid_sandbox_modes = {
+  ['read-only'] = true,
+  ['workspace-write'] = true,
+  ['danger-full-access'] = true,
+}
+
+local valid_approval_policies = {
+  untrusted = true,
+  ['on-failure'] = true,
+  ['on-request'] = true,
+  never = true,
+}
+
+local function launch_option_completion()
+  return {
+    'read-only',
+    'workspace-write',
+    'danger-full-access',
+    'untrusted',
+    'on-failure',
+    'on-request',
+    'never',
+  }
+end
+
+local function parse_command_opts(args)
+  local launch_opts = {}
+
+  if not args or args == '' then
+    return launch_opts
+  end
+
+  for token in string.gmatch(args, '%S+') do
+    if valid_sandbox_modes[token] then
+      if launch_opts.sandbox and launch_opts.sandbox ~= token then
+        vim.notify('[codex.nvim] Multiple sandbox modes provided', vim.log.levels.ERROR)
+        return nil
+      end
+      launch_opts.sandbox = token
+    elseif valid_approval_policies[token] then
+      if launch_opts.approval and launch_opts.approval ~= token then
+        vim.notify('[codex.nvim] Multiple approval policies provided', vim.log.levels.ERROR)
+        return nil
+      end
+      launch_opts.approval = token
+    else
+      vim.notify('[codex.nvim] Invalid launch option: ' .. tostring(token), vim.log.levels.ERROR)
+      return nil
+    end
+  end
+
+  return launch_opts
+end
+
+local function resolve_launch_opts(opts)
+  local launch_opts = opts or {}
+  local sandbox = launch_opts.sandbox
+  local approval = launch_opts.approval
+  local prompt = launch_opts.prompt
+
+  if sandbox == nil then
+    sandbox = config.sandbox
+  end
+
+  if approval == nil then
+    approval = config.approval
+  end
+
+  if sandbox ~= nil and not valid_sandbox_modes[sandbox] then
+    vim.notify(
+      '[codex.nvim] Invalid sandbox mode: ' .. tostring(sandbox),
+      vim.log.levels.ERROR
+    )
+    return nil
+  end
+
+  if approval ~= nil and not valid_approval_policies[approval] then
+    vim.notify(
+      '[codex.nvim] Invalid approval policy: ' .. tostring(approval),
+      vim.log.levels.ERROR
+    )
+    return nil
+  end
+
+  return {
+    sandbox = sandbox,
+    approval = approval,
+    prompt = prompt,
+  }
+end
+
+local function build_cmd_args(launch_opts)
+  local cmd_args = type(config.cmd) == 'string' and { config.cmd } or vim.deepcopy(config.cmd)
+
+  if config.model then
+    table.insert(cmd_args, '-m')
+    table.insert(cmd_args, config.model)
+  end
+
+  if launch_opts.sandbox then
+    table.insert(cmd_args, '--sandbox')
+    table.insert(cmd_args, launch_opts.sandbox)
+  end
+
+  if launch_opts.approval then
+    table.insert(cmd_args, '--ask-for-approval')
+    table.insert(cmd_args, launch_opts.approval)
+  end
+
+  if launch_opts.prompt and launch_opts.prompt ~= '' then
+    table.insert(cmd_args, launch_opts.prompt)
+  end
+
+  return cmd_args
+end
+
+local function get_visual_selection()
+  local start_pos = vim.fn.getpos "'<"
+  local end_pos = vim.fn.getpos "'>"
+  local start_row = start_pos[2]
+  local start_col = start_pos[3]
+  local end_row = end_pos[2]
+  local end_col = end_pos[3]
+
+  if start_row == 0 or end_row == 0 then
+    return nil
+  end
+
+  if start_row > end_row or (start_row == end_row and start_col > end_col) then
+    start_row, end_row = end_row, start_row
+    start_col, end_col = end_col, start_col
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(0, start_row - 1, end_row, false)
+
+  if vim.tbl_isempty(lines) then
+    return nil
+  end
+
+  lines[1] = string.sub(lines[1], start_col, #lines[1])
+  lines[#lines] = string.sub(lines[#lines], 1, end_col)
+
+  return table.concat(lines, '\n')
+end
+
+local function is_job_active(job)
+  return type(job) == 'number' and job > 0 and vim.fn.jobwait({ job }, 0)[1] == -1
+end
+
+local function reset_session()
+  if state.job then
+    vim.fn.jobstop(state.job)
+    state.job = nil
+  end
+
+  if state.win and vim.api.nvim_win_is_valid(state.win) then
+    vim.api.nvim_win_close(state.win, true)
+  end
+  state.win = nil
+
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+    pcall(vim.api.nvim_buf_delete, state.buf, { force = true })
+  end
+  state.buf = nil
+end
+
 function M.setup(user_config)
   config = vim.tbl_deep_extend('force', config, user_config or {})
 
-  vim.api.nvim_create_user_command('Codex', function()
-    M.toggle()
-  end, { desc = 'Toggle Codex popup' })
+  vim.api.nvim_create_user_command('Codex', function(opts)
+    local launch_opts = parse_command_opts(opts.args)
+    if not launch_opts then
+      return
+    end
+    M.toggle(launch_opts)
+  end, {
+    desc = 'Toggle Codex popup',
+    nargs = '*',
+    complete = launch_option_completion,
+  })
 
-  vim.api.nvim_create_user_command('CodexToggle', function()
-    M.toggle()
-  end, { desc = 'Toggle Codex popup (alias)' })
+  vim.api.nvim_create_user_command('CodexToggle', function(opts)
+    local launch_opts = parse_command_opts(opts.args)
+    if not launch_opts then
+      return
+    end
+    M.toggle(launch_opts)
+  end, {
+    desc = 'Toggle Codex popup (alias)',
+    nargs = '*',
+    complete = launch_option_completion,
+  })
+
+  vim.api.nvim_create_user_command('CodexSendSelection', function()
+    M.send_selection()
+  end, {
+    desc = 'Send the current visual selection to Codex',
+    range = true,
+  })
 
   if config.keymaps.toggle then
     vim.api.nvim_set_keymap('n', config.keymaps.toggle, '<cmd>CodexToggle<CR>', { noremap = true, silent = true })
+  end
+
+  if config.keymaps.send_selection then
+    vim.keymap.set('x', config.keymaps.send_selection, function()
+      M.send_selection()
+    end, { noremap = true, silent = true, desc = 'Send selection to Codex' })
   end
 end
 
@@ -100,7 +298,17 @@ local function open_panel()
   state.win = win
 end
 
-function M.open()
+function M.open(opts)
+  local launch_opts = resolve_launch_opts(opts)
+
+  if not launch_opts then
+    return
+  end
+
+  if launch_opts.prompt then
+    reset_session()
+  end
+
   local function create_clean_buf()
     local buf = vim.api.nvim_create_buf(false, false)
 
@@ -130,7 +338,7 @@ function M.open()
     if config.autoinstall then
       installer.prompt_autoinstall(function(success)
         if success then
-          M.open() -- Try again after installing
+          M.open(launch_opts) -- Try again after installing
         else
           -- Show failure message *after* buffer is created
           if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
@@ -175,12 +383,7 @@ function M.open()
   if config.panel then open_panel() else open_window() end
 
   if not state.job then
-    -- assemble command
-    local cmd_args = type(config.cmd) == 'string' and { config.cmd } or vim.deepcopy(config.cmd)
-    if config.model then
-      table.insert(cmd_args, '-m')
-      table.insert(cmd_args, config.model)
-    end
+    local cmd_args = build_cmd_args(launch_opts)
 
     if config.use_buffer then
       -- capture stdout/stderr into normal buffer
@@ -222,6 +425,36 @@ function M.open()
   end
 end
 
+function M.send_selection(opts)
+  local selection = get_visual_selection()
+
+  if not selection or selection == '' then
+    vim.notify('[codex.nvim] No visual selection available to send', vim.log.levels.WARN)
+    return
+  end
+
+  if is_job_active(state.job) and not config.use_buffer then
+    if state.win and vim.api.nvim_win_is_valid(state.win) then
+      vim.api.nvim_set_current_win(state.win)
+    else
+      if config.panel then
+        open_panel()
+      else
+        open_window()
+      end
+    end
+
+    vim.fn.chansend(state.job, selection .. '\n')
+    return
+  end
+
+  local launch_opts = vim.tbl_extend('force', opts or {}, {
+    prompt = selection,
+  })
+
+  M.open(launch_opts)
+end
+
 function M.close()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_win_close(state.win, true)
@@ -229,11 +462,11 @@ function M.close()
   state.win = nil
 end
 
-function M.toggle()
+function M.toggle(opts)
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     M.close()
   else
-    M.open()
+    M.open(opts)
   end
 end
 
